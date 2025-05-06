@@ -5,123 +5,199 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/types.h>
 
-#define N 16  // Размер блока для чтения
+volatile sig_atomic_t sig1_flag = 0;
+volatile sig_atomic_t sig2_flag = 0;
 
-int fd;
-pid_t parent_pid, child_pid;
+pid_t other_pid;
 
-// Обработчик сигналов для родительского процесса
-void parent_handler(int sig) {
-    if (sig == SIGUSR1) {
-        char buffer[N];
-        ssize_t bytes_read = read(fd, buffer, N);
-        if (bytes_read > 0) {
-            // Сообщение о начале вывода родительским процессом
-            write(STDOUT_FILENO, "\nParent process is writing data...\n", 36);
-            write(STDOUT_FILENO, buffer, bytes_read);
-            kill(child_pid, SIGUSR1);
-        } else {
-            // Конец файла - завершение обоих процессов
-            write(STDOUT_FILENO, "\nParent: End of file reached. Sending termination signal...\n", 61);
-            kill(child_pid, SIGUSR2);
-            exit(0);
-        }
-    } else if (sig == SIGUSR2) {
-        // Получен сигнал о завершении от дочернего
-        write(STDOUT_FILENO, "\nParent: Terminating as requested by child process.\n", 53);
-        exit(0);
-    }
+void sig1_handler(int sig) {
+    sig1_flag = 1;
 }
 
-// Обработчик сигналов для дочернего процесса
-void child_handler(int sig) {
-    if (sig == SIGUSR1) {
-        char buffer[N];
-        ssize_t bytes_read = read(fd, buffer, N);
-        if (bytes_read > 0) {
-            // Сообщение о начале вывода дочерним процессом
-            write(STDOUT_FILENO, "\nChild process is writing data...\n", 35);
-            write(STDOUT_FILENO, buffer, bytes_read);
-            kill(parent_pid, SIGUSR1);
-        } else {
-            // Конец файла - завершение обоих процессов
-            write(STDOUT_FILENO, "\nChild: End of file reached. Sending termination signal...\n", 60);
-            kill(parent_pid, SIGUSR2);
-            exit(0);
-        }
-    } else if (sig == SIGUSR2) {
-        // Получен сигнал о завершении от родительского
-        write(STDOUT_FILENO, "\nChild: Terminating as requested by parent process.\n", 53);
-        exit(0);
-    }
+void sig2_handler(int sig) {
+    sig2_flag = 1;
+}
+
+void error(const char *msg) {
+    perror(msg);
+    exit(EXIT_FAILURE);
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <filename> <N>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
     const char *filename = argv[1];
-    fd = open(filename, O_RDONLY);
+    int N = atoi(argv[2]);
+    if (N <= 0) {
+        fprintf(stderr, "N must be positive\n");
+        exit(EXIT_FAILURE);
+    }
+
+    int fd = open(filename, O_RDONLY);
     if (fd == -1) {
-        perror("Failed to open file");
+        perror("open");
         exit(EXIT_FAILURE);
     }
 
-    parent_pid = getpid();
-
-    // Настройка обработчиков сигналов для родителя
-    struct sigaction sa_parent;
-    sigemptyset(&sa_parent.sa_mask);
-    sa_parent.sa_flags = 0;
-    sa_parent.sa_handler = parent_handler;
-    sigaction(SIGUSR1, &sa_parent, NULL);
-    sigaction(SIGUSR2, &sa_parent, NULL);
-
-    // Создание дочернего процесса
-    child_pid = fork();
+    pid_t child_pid = fork();
     if (child_pid == -1) {
-        perror("Fork failed");
+        perror("fork");
+        close(fd);
         exit(EXIT_FAILURE);
     }
 
-    if (child_pid == 0) {
-        // Дочерний процесс: настройка обработчиков
-        struct sigaction sa_child;
-        sigemptyset(&sa_child.sa_mask);
-        sa_child.sa_flags = 0;
-        sa_child.sa_handler = child_handler;
-        sigaction(SIGUSR1, &sa_child, NULL);
-        sigaction(SIGUSR2, &sa_child, NULL);
+    // Установка обработчиков сигналов
+    struct sigaction sa1, sa2;
+    memset(&sa1, 0, sizeof(sa1));
+    sa1.sa_handler = sig1_handler;
+    sa1.sa_flags = SA_RESTART;
+    if (sigaction(SIGUSR1, &sa1, NULL) == -1) {
+        perror("sigaction SIGUSR1");
+        exit(EXIT_FAILURE);
+    }
 
-        write(STDOUT_FILENO, "\nChild process started. Waiting for signal...\n", 47);
-        while (1) {
-            pause();  // Ожидание сигнала
-        }
-    } else {
-        // Родительский процесс: начать чтение
-        write(STDOUT_FILENO, "\nParent process started. Beginning file reading...\n", 52);
-        char buffer[N];
-        ssize_t bytes_read = read(fd, buffer, N);
-        if (bytes_read > 0) {
-            write(STDOUT_FILENO, "\nParent process is writing initial data...\n", 44);
-            write(STDOUT_FILENO, buffer, bytes_read);
-            kill(child_pid, SIGUSR1);
-        } else {
-            write(STDOUT_FILENO, "\nParent: File is empty. Terminating.\n", 38);
-            kill(child_pid, SIGUSR2);
-            exit(0);
-        }
+    memset(&sa2, 0, sizeof(sa2));
+    sa2.sa_handler = sig2_handler;
+    sa2.sa_flags = SA_RESTART;
+    if (sigaction(SIGUSR2, &sa2, NULL) == -1) {
+        perror("sigaction SIGUSR2");
+        exit(EXIT_FAILURE);
+    }
+
+    // Блокируем сигналы SIGUSR1 и SIGUSR2
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR1);
+    sigaddset(&mask, SIGUSR2);
+    if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1) {
+        perror("sigprocmask");
+        exit(EXIT_FAILURE);
+    }
+
+    if (child_pid == 0) { // процесс 2
+        other_pid = getppid(); // PID родителя
 
         while (1) {
-            pause();  // Ожидание сигнала от дочернего процесса
+            // Ожидаем сигнала SIGUSR1 от родителя
+            sig1_flag = 0;
+            sig2_flag = 0;
+
+            // Создаем маску для ожидания
+            sigset_t wait_mask;
+            if (sigprocmask(0, NULL, &wait_mask) == -1) {
+                perror("sigprocmask");
+                exit(EXIT_FAILURE);
+            }
+            sigdelset(&wait_mask, SIGUSR1);
+            sigdelset(&wait_mask, SIGUSR2);
+
+            while (!sig1_flag && !sig2_flag) {
+                sigsuspend(&wait_mask); // ожидаем сигнал
+            }
+
+            if (sig2_flag) {
+                exit(EXIT_SUCCESS);
+            }
+
+            // Читаем N байт
+            char *buffer = malloc(N + 1);
+            if (!buffer) {
+                perror("malloc");
+                kill(other_pid, SIGUSR2);
+                exit(EXIT_FAILURE);
+            }
+
+            int bytes_read = read(fd, buffer, N);
+            if (bytes_read == -1) {
+                perror("read");
+                kill(other_pid, SIGUSR2);
+                free(buffer);
+                exit(EXIT_FAILURE);
+            }
+
+            if (bytes_read == 0) { // EOF
+                kill(other_pid, SIGUSR2);
+                free(buffer);
+                exit(EXIT_SUCCESS);
+            }
+
+            buffer[bytes_read] = '\0';
+            printf("Process 2: %.*s\n", bytes_read, buffer);
+            free(buffer);
+
+            // Отправляем SIGUSR1 родителю
+            if (kill(other_pid, SIGUSR1) == -1) {
+                exit(EXIT_FAILURE);
+            }
+        }
+    } else { // процесс 1
+        other_pid = child_pid;
+
+        while (1) {
+            // Читаем N байт
+            char *buffer = malloc(N + 1);
+            if (!buffer) {
+                perror("malloc");
+                kill(other_pid, SIGUSR2);
+                close(fd);
+                exit(EXIT_FAILURE);
+            }
+
+            int bytes_read = read(fd, buffer, N);
+            if (bytes_read == -1) {
+                perror("read");
+                kill(other_pid, SIGUSR2);
+                free(buffer);
+                close(fd);
+                exit(EXIT_FAILURE);
+            }
+
+            if (bytes_read == 0) { // EOF
+                kill(other_pid, SIGUSR2);
+                free(buffer);
+                close(fd);
+                exit(EXIT_SUCCESS);
+            }
+
+            buffer[bytes_read] = '\0';
+            printf("Process 1: %.*s\n", bytes_read, buffer);
+            free(buffer);
+
+            // Отправляем SIGUSR1 дочернему
+            if (kill(other_pid, SIGUSR1) == -1) {
+                exit(EXIT_FAILURE);
+            }
+
+            // Ожидаем сигнала от дочернего
+            sig1_flag = 0;
+            sig2_flag = 0;
+
+            // Создаем маску для ожидания
+            sigset_t wait_mask;
+            if (sigprocmask(0, NULL, &wait_mask) == -1) {
+                perror("sigprocmask");
+                exit(EXIT_FAILURE);
+            }
+            sigdelset(&wait_mask, SIGUSR1);
+            sigdelset(&wait_mask, SIGUSR2);
+
+            while (!sig1_flag && !sig2_flag) {
+                sigsuspend(&wait_mask); // ожидаем
+            }
+
+            if (sig2_flag) {
+                close(fd);
+                exit(EXIT_SUCCESS);
+            }
         }
     }
 
